@@ -333,6 +333,17 @@ export async function ingest(
 	if (!Array.isArray(events) || events.length === 0) return;
 
 	const sessionContext = payload.sessionContext ?? {};
+	// Optional provenance overrides (used by OpenCode plugin observer batches to scope
+	// memories per agent/person). Callers may inject actor info into sessionContext.
+	const provenanceOverride: Record<string, unknown> = {};
+	{
+		const sc = sessionContext as unknown as Record<string, unknown>;
+		const actorId = typeof sc.actor_id === "string" ? sc.actor_id.trim() : "";
+		const actorDisplayName =
+			typeof sc.actor_display_name === "string" ? sc.actor_display_name.trim() : "";
+		if (actorId) provenanceOverride.actor_id = actorId;
+		if (actorDisplayName) provenanceOverride.actor_display_name = actorDisplayName;
+	}
 	const storeSummary = options.storeSummary ?? true;
 	const storeTyped = options.storeTyped ?? true;
 	const maxChars = options.maxChars ?? 12_000;
@@ -684,6 +695,7 @@ export async function ingest(
 					filesModified: obs.filesModified,
 				});
 				const memoryId = store.remember(sessionId, kind, memoryTitle, bodyText, 0.5, tags, {
+					...provenanceOverride,
 					subtitle: obs.subtitle,
 					narrative: obs.narrative,
 					facts: obs.facts,
@@ -737,6 +749,7 @@ export async function ingest(
 					0.3,
 					summaryTags,
 					{
+						...provenanceOverride,
 						is_summary: true,
 						request,
 						investigated: summary.investigated,

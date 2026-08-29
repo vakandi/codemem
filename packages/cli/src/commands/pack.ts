@@ -23,6 +23,7 @@ type PackCommandOptions = DbOpts &
 		allProjects?: boolean;
 		compact?: boolean;
 		compactDetail?: string;
+		actorId?: string;
 	};
 
 function describeCandidate(candidate: PackTrace["retrieval"]["candidates"][number]): string[] {

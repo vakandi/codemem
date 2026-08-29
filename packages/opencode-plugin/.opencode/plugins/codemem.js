@@ -198,12 +198,15 @@ const buildInjectQuery = ({ firstPrompt, lastPromptText, projectName, filesModif
   return query.length > 500 ? query.slice(0, 500) : query;
 };
 
-const buildPackArgs = ({ query, filesModified, injectLimit, injectTokenBudget }) => {
+const buildPackArgs = ({ query, filesModified, injectLimit, injectTokenBudget, agentScope }) => {
   const workingSetFiles = Array.from(filesModified || [])
     .slice(-8)
     .map((value) => String(value || "").trim())
     .filter(Boolean);
   const args = ["pack", query, "--json"];
+  if (agentScope && String(agentScope).trim()) {
+    args.push("--project", String(agentScope).trim());
+  }
   if (injectLimit !== null && Number.isFinite(injectLimit) && injectLimit > 0) {
     args.push("--limit", String(injectLimit));
   }
@@ -273,7 +276,7 @@ const applyInjectedContextToOutput = async ({
       if (!injectionToastShown.has(input.sessionID) && showToast) {
         injectionToastShown.add(input.sessionID);
         try {
-          await showToast(buildInjectionToastMessage(injected.metrics));
+          await showToast(buildInjectionToastMessage(injected.metrics, injected.text));
         } catch {
           // best-effort only
         }
@@ -595,7 +598,23 @@ const parsePositiveInt = (value, fallback) => {
   return parsed;
 };
 
-export const buildInjectionToastMessage = (metrics) => {
+const extractInjectedItemLines = (packText) => {
+  if (!packText || typeof packText !== "string") {
+    return [];
+  }
+  const lines = [];
+  for (const rawLine of packText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // `[123] (kind) title` — the pack index/item line shape.
+    if (/^\[\d+\]\s*\([^)]*\)\s*\S/.test(line)) {
+      lines.push(line);
+    }
+  }
+  return lines;
+};
+
+export const buildInjectionToastMessage = (metrics, packText) => {
   const items = asFiniteNonNegativeInt(metrics?.items);
   const packTokens = asFiniteNonNegativeInt(metrics?.pack_tokens);
   const avoided = asFiniteNonNegativeInt(metrics?.avoided_work_tokens);
@@ -620,6 +639,15 @@ export const buildInjectionToastMessage = (metrics) => {
   if (deltaAvailable && (addedCount !== null || removedCount !== null)) {
     messageParts.push(`delta +${addedCount || 0}/-${removedCount || 0}`);
   }
+
+  const injectedLines = extractInjectedItemLines(packText);
+  if (injectedLines.length > 0) {
+    const previewLines = injectedLines.slice(0, 6);
+    const truncated = injectedLines.length > previewLines.length;
+    const preview = previewLines.map((line) => `- ${line}`).join("\n");
+    messageParts.push(`\n${preview}${truncated ? `\n… +${injectedLines.length - previewLines.length} more` : ""}`);
+  }
+
   return messageParts.join(" · ");
 };
 
@@ -674,6 +702,7 @@ export const OpencodeMemPlugin = async ({
   client,
   directory,
   worktree,
+  serverUrl,
 }) => {
   const events = [];
   const maxEvents = parsePositiveInt(process.env.CODEMEM_PLUGIN_MAX_EVENTS, 200);
@@ -848,7 +877,7 @@ export const OpencodeMemPlugin = async ({
       type,
       payload,
       cwd,
-      project: resolveProjectName(project, cwd),
+      project: resolveAgentScope() || resolveProjectName(project, cwd),
       startedAt: sessionStartedAt,
       nowMs: now,
       nowMono:
@@ -1049,6 +1078,7 @@ export const OpencodeMemPlugin = async ({
     startTime: null,
     filesModified: new Set(),
     filesRead: new Set(),
+    currentAgent: null,
   };
 
   const resetSessionContext = () => {
@@ -1058,6 +1088,7 @@ export const OpencodeMemPlugin = async ({
     sessionContext.startTime = null;
     sessionContext.filesModified = new Set();
     sessionContext.filesRead = new Set();
+    sessionContext.currentAgent = null;
   };
 
   // Check if we should force flush immediately (threshold-based)
@@ -1487,6 +1518,31 @@ export const OpencodeMemPlugin = async ({
       filesModified: sessionContext.filesModified,
     });
 
+  /** Use the agent name as-is from OpenCode config/events — no hardcoded map. */
+  const normalizeOpenCodeAgentLabel = (raw) => {
+    if (!raw) return "";
+    return String(raw)
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .trim()
+      .toLowerCase();
+  };
+
+  const resolveAgentScope = () => {
+    const base = resolveProjectName(project, cwd) || inferProjectFromCwd(cwd) || null;
+    const agentId = normalizeOpenCodeAgentLabel(sessionContext.currentAgent);
+    if (!agentId) return base;
+    return base ? `${base}/${agentId}` : agentId;
+  };
+
+  const buildMemRecentCliArgs = (limitStr) => {
+    const args = ["recent", "--limit", limitStr];
+    const scopedProject = resolveAgentScope();
+    if (scopedProject) {
+      args.push("--project", scopedProject);
+    }
+    return args;
+  };
+
   const describeInjectQuery = (query) => {
     const safeQuery = redactLog((query || "").trim(), 240);
     const projectName = resolveProjectName(project, cwd) || "";
@@ -1506,11 +1562,17 @@ export const OpencodeMemPlugin = async ({
   };
 
   const buildInjectedContext = async (query) => {
+    const scope = resolveAgentScope() || resolveProjectName(project, cwd) || inferProjectFromCwd(cwd) || null;
+    if (!scope) {
+      await logLine(`inject.skip.no_project query_len=${query ? query.length : 0}`);
+      return "";
+    }
     const packArgs = buildPackArgs({
       query,
       filesModified: sessionContext.filesModified,
       injectLimit,
       injectTokenBudget,
+      agentScope: scope,
     });
     const result = await runCli(packArgs);
     if (!result || result.exitCode !== 0) {
@@ -1784,6 +1846,312 @@ export const OpencodeMemPlugin = async ({
     resetSessionContext();
   };
 
+  // -------------------------------------------------------------------------
+  // Plugin-observer loop — polls viewer for pending batches, calls LLM via
+  // OpenCode SDK, posts result back. Runs every 30s in background.
+  // -------------------------------------------------------------------------
+  const OBSERVER_POLL_MS = 30_000;
+  let observerLoopActive = false;
+  // Track observer-only OpenCode sessions so they don't interfere with viewer lifecycle.
+  const observerSessions = new Set();
+
+  // Use Node.js http.request directly to bypass HTTP_PROXY for localhost calls
+  const { request: httpRequest } = await import("node:http");
+  await logLine(`observer.proxy HTTP_PROXY=${process.env.HTTP_PROXY || "none"} NO_PROXY=${process.env.NO_PROXY || "none"} serverUrl=${serverUrl || "none"}`);
+  const localFetch = (url, opts = {}) => new Promise((resolve, reject) => {
+    // Temporarily clear proxy env vars so http.request goes direct
+    const savedVars = {
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      http_proxy: process.env.http_proxy,
+      https_proxy: process.env.https_proxy,
+    };
+    delete process.env.HTTP_PROXY;
+    delete process.env.HTTPS_PROXY;
+    delete process.env.http_proxy;
+    delete process.env.https_proxy;
+
+    const parsed = new URL(url);
+    const body = opts.body ? String(opts.body) : null;
+    const method = opts.method || "GET";
+    const defaultTimeout =
+      typeof opts.timeoutMs === "number"
+        ? opts.timeoutMs
+        : method === "POST"
+          ? 30_000
+          : 10_000;
+    const reqOpts = {
+      hostname: parsed.hostname,
+      port: parsed.port || 80,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers: { ...(opts.headers || {}), ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}) },
+      timeout: defaultTimeout,
+    };
+    const req = httpRequest(reqOpts, (res) => {
+      // Restore proxy vars
+      for (const [k, v] of Object.entries(savedVars)) {
+        if (v !== undefined) process.env[k] = v; else delete process.env[k];
+      }
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          json: () => Promise.resolve(JSON.parse(data)),
+          text: () => Promise.resolve(data),
+        });
+      });
+    });
+    req.on("error", (err) => {
+      for (const [k, v] of Object.entries(savedVars)) {
+        if (v !== undefined) process.env[k] = v; else delete process.env[k];
+      }
+      reject(err);
+    });
+    if (opts.signal) opts.signal.addEventListener("abort", () => req.destroy(new Error("aborted")));
+    if (body) req.write(body);
+    req.end();
+  });
+
+  const runObserverLoop = async () => {
+    if (observerLoopActive) return;
+    observerLoopActive = true;
+    try {
+      const pendingUrl = `http://${viewerHost}:${viewerPort}/api/plugin-observer/pending`;
+      const resultUrl = `http://${viewerHost}:${viewerPort}/api/plugin-observer/result`;
+
+      const resp = await localFetch(pendingUrl, { signal: AbortSignal.timeout(5000) });
+      if (resp.status === 204) {
+        await logLine(`observer.poll.empty`);
+        return;
+      }
+      if (!resp.ok) {
+        await logLine(`observer.poll.error status=${resp.status}`);
+        return;
+      }
+
+      const batch = await resp.json();
+      const { batch_id, session_id, source, start_seq, end_seq, system, user } = batch;
+      await logLine(`observer.batch batch_id=${batch_id} session=${session_id} seqs=${start_seq}-${end_seq}`);
+
+      // Prefer the OpenCode plugin SDK client when available (no port guessing, no proxy issues).
+      // Fall back to local HTTP calls when SDK isn't present.
+      const sdkSession = client?.session;
+      const canUseSdk =
+        sdkSession &&
+        typeof sdkSession.create === "function" &&
+        (typeof sdkSession.promptAsync === "function" || typeof sdkSession.prompt === "function") &&
+        typeof sdkSession.messages === "function";
+
+      // Use localFetch to call OpenCode API directly via serverUrl (bypasses proxy)
+      const opencodeBase = serverUrl
+        ? `http://127.0.0.1:${serverUrl.port || "4096"}`
+        : "http://127.0.0.1:4096";
+
+      let observerSessionId = null;
+      if (canUseSdk) {
+        try {
+          const createBody = {
+            title: "codemem-observer",
+            permission: [
+              { permission: "tool", pattern: "*", action: "deny" },
+              { permission: "write", pattern: "*", action: "deny" },
+            ],
+          };
+          // SDK signature differs across versions; try common shapes.
+          let created = null;
+          try { created = await sdkSession.create({ body: createBody }); } catch {}
+          if (!created) created = await sdkSession.create(createBody);
+          observerSessionId = created?.data?.id ?? created?.id ?? null;
+        } catch (e) {
+          await logLine(`observer.session.create.sdk_failed ${String(e).slice(0, 200)}`);
+          observerSessionId = null;
+        }
+      }
+      if (!observerSessionId) {
+        // Fallback: create session over local HTTP
+        const sessionResp = await localFetch(`${opencodeBase}/session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "codemem-observer",
+            permission: [
+              { permission: "tool", pattern: "*", action: "deny" },
+              { permission: "write", pattern: "*", action: "deny" },
+            ],
+          }),
+        });
+        if (!sessionResp.ok) {
+          await logLine(`observer.session.create.failed status=${sessionResp.status}`);
+          return;
+        }
+        const sessionData = await sessionResp.json();
+        observerSessionId = sessionData?.id ?? null;
+      }
+      await logLine(`observer.session.created id=${observerSessionId}`);
+
+      if (!observerSessionId) {
+        await logLine(`observer.session.create.no_id`);
+        return;
+      }
+      observerSessions.add(observerSessionId);
+
+      // Send via prompt_async (returns immediately; blocking /message hits socket timeout)
+      const fullPrompt = `${system}\n\n${user}`;
+      const observerModelID =
+        String(process.env.CODEMEM_OBSERVER_MODEL || "").trim() || "big-pickle";
+      const observerProviderID =
+        String(process.env.CODEMEM_OBSERVER_PROVIDER || "").trim() || "opencode";
+      await logLine(
+        `observer.prompt_async.sending len=${fullPrompt.length} model=${observerProviderID}/${observerModelID} session=${observerSessionId} sdk=${canUseSdk}`
+      );
+
+      let promptAccepted = false;
+      if (canUseSdk && typeof sdkSession.promptAsync === "function") {
+        try {
+          const promptBody = {
+            model: { providerID: observerProviderID, modelID: observerModelID },
+            parts: [{ type: "text", text: fullPrompt }],
+          };
+          // Try common shapes for SDK promptAsync
+          let ok = false;
+          try {
+            await sdkSession.promptAsync({ path: { id: observerSessionId }, body: promptBody });
+            ok = true;
+          } catch {}
+          if (!ok) {
+            await sdkSession.promptAsync({ id: observerSessionId, body: promptBody });
+          }
+          promptAccepted = true;
+        } catch (e) {
+          await logLine(`observer.prompt_async.sdk_failed ${String(e).slice(0, 200)}`);
+        }
+      }
+      if (!promptAccepted) {
+        const promptResp = await localFetch(
+          `${opencodeBase}/session/${observerSessionId}/prompt_async`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: { providerID: observerProviderID, modelID: observerModelID },
+              parts: [{ type: "text", text: fullPrompt }],
+            }),
+            timeoutMs: 30_000,
+          }
+        );
+        if (!promptResp.ok) {
+          const errBody = await promptResp.text().catch(() => "");
+          await logLine(
+            `observer.prompt_async.failed status=${promptResp.status} body=${errBody.slice(0, 200)}`
+          );
+          localFetch(`${opencodeBase}/session/${observerSessionId}`, { method: "DELETE" }).catch(() => {});
+          return;
+        }
+      }
+      await logLine(`observer.prompt_async.accepted polling...`);
+
+      // Poll for the assistant response (max 300s)
+      const deadline = Date.now() + 300_000;
+      let llmOutput = null;
+      let lastAssistantText = null;
+      let pollCount = 0;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        pollCount++;
+        let msgs = null;
+        if (canUseSdk) {
+          try {
+            let sdkMsgs = null;
+            try { sdkMsgs = await sdkSession.messages({ path: { id: observerSessionId } }); } catch {}
+            if (!sdkMsgs) sdkMsgs = await sdkSession.messages({ id: observerSessionId });
+            msgs = sdkMsgs?.data ?? sdkMsgs ?? null;
+          } catch (e) {
+            await logLine(`observer.poll.sdk_failed ${String(e).slice(0, 200)}`);
+          }
+        }
+        if (!msgs) {
+          const msgsResp = await localFetch(`${opencodeBase}/session/${observerSessionId}/message`, {
+            timeoutMs: 60_000,
+          });
+          if (!msgsResp.ok) {
+            await logLine(`observer.poll.msgs.failed status=${msgsResp.status} poll=${pollCount}`);
+            continue;
+          }
+          msgs = await msgsResp.json();
+        }
+        if (!Array.isArray(msgs)) continue;
+        if (pollCount % 5 === 0) await logLine(`observer.poll.tick poll=${pollCount} msgs=${msgs.length}`);
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const msg = msgs[i];
+          if (msg?.info?.role !== "assistant") continue;
+          const text = (msg.parts || [])
+            .filter((p) => p.type === "text" && p.text)
+            .map((p) => p.text)
+            .join("\n")
+            .trim();
+          if (!text) continue;
+          lastAssistantText = text;
+          // OpenCode server versions differ: some set info.finished=true, others use info.finish and/or info.time.completed.
+          const isFinished = Boolean(
+            msg?.info?.finished ||
+            msg?.info?.finish ||
+            (msg?.info?.time && msg.info.time.completed)
+          );
+          if (isFinished) { llmOutput = text; break; }
+        }
+        if (llmOutput) break;
+      }
+      if (!llmOutput && lastAssistantText) {
+        await logLine(`observer.poll.fallback using last assistant text len=${lastAssistantText.length}`);
+        llmOutput = lastAssistantText;
+      }
+      if (!llmOutput) await logLine(`observer.poll.timeout after ${pollCount} polls`);
+
+      // Clean up session
+      localFetch(`${opencodeBase}/session/${observerSessionId}`, { method: "DELETE" })
+        .catch(() => {})
+        .finally(() => {
+          observerSessions.delete(observerSessionId);
+        });
+
+      if (!llmOutput) {
+        await logLine(`observer.llm.empty batch_id=${batch_id}`);
+        return;
+      }
+      await logLine(`observer.llm.ok batch_id=${batch_id} len=${llmOutput.length}`);
+
+      // Post result back to viewer
+      const postResp = await localFetch(resultUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batch_id, session_id, source, start_seq, end_seq, llm_output: llmOutput }),
+      });
+
+      if (!postResp.ok) {
+        const errText = await postResp.text().catch(() => "");
+        await logLine(`observer.result.error status=${postResp.status} body=${errText.slice(0, 200)}`);
+      } else {
+        await logLine(`observer.result.ok batch_id=${batch_id}`);
+      }
+    } catch (err) {
+      await logLine(`observer.loop.error ${String(err).slice(0, 200)}`);
+      try {
+        await client.app.log({ body: { service: "codemem-observer", level: "error", message: `observer loop error: ${String(err).slice(0, 200)}` } });
+      } catch {}
+    } finally {
+      observerLoopActive = false;
+    }
+  };
+
+  // Start the observer loop after a short delay (let viewer start first)
+  setTimeout(() => {
+    runObserverLoop();
+    setInterval(runObserverLoop, OBSERVER_POLL_MS);
+  }, 10_000);
+
   return {
     "experimental.chat.system.transform": async (input, output) => {
       const query = resolveInjectQuery();
@@ -1890,6 +2258,16 @@ export const OpencodeMemPlugin = async ({
           "message.part.updated",
         ].includes(eventType)
       ) {
+        // Capture agent from user messages
+        const msgInfo = event?.properties?.info;
+        if (msgInfo && msgInfo.role === "user" && msgInfo.agent && String(msgInfo.agent).trim()) {
+          const detectedAgent = String(msgInfo.agent).trim();
+          if (sessionContext.currentAgent !== detectedAgent) {
+            sessionContext.currentAgent = detectedAgent;
+            await logLine(`agent.detected agent=${detectedAgent}`);
+          }
+        }
+
         const promptText = extractPromptText(event);
         if (promptText) {
           // Update activity tracking
@@ -1986,7 +2364,24 @@ export const OpencodeMemPlugin = async ({
         await flushEvents();
       }
 
+      if (eventType === "session.next.agent.switched") {
+        const nextAgent =
+          event?.properties?.agent ||
+          event?.properties?.nextAgent ||
+          event?.properties?.info?.agent ||
+          null;
+        if (nextAgent && String(nextAgent).trim()) {
+          sessionContext.currentAgent = String(nextAgent).trim();
+          await logLine(`agent.detected agent=${sessionContext.currentAgent}`);
+        }
+      }
+
       if (eventType === "session.created") {
+        // Ignore observer-only sessions created by the background plugin-observer loop.
+        // They must not reset the active session context nor control viewer lifecycle.
+        if (observerSessions && observerSessions.has(sessionID)) {
+          return;
+        }
         if (events.length) {
           await flushEvents();
         }
@@ -1999,6 +2394,11 @@ export const OpencodeMemPlugin = async ({
         startViewer();
       }
       if (eventType === "session.deleted") {
+        // Ignore observer-only sessions; otherwise each observer cleanup would stop the viewer mid-ingest.
+        if (observerSessions && observerSessions.has(sessionID)) {
+          observerSessions.delete(sessionID);
+          return;
+        }
         activeSessionID = null;
         await stopViewer();
       }
@@ -2047,28 +2447,117 @@ export const OpencodeMemPlugin = async ({
       }
     },
     tool: {
-      "mem-status": tool({
-        description: "Show codemem stats and recent entries",
+      // ── Per-agent tools (default) ──────────────────────────────────
+
+      "mem-stats": tool({
+        description:
+          "Show codemem stats for this agent/project (stats itself is DB-level, appended with scope info). Use mem-all-stats for raw global stats.",
         args: {},
         async execute() {
+          const scope = resolveAgentScope();
           const stats = await runCli(["stats"]);
-          const recent = await runCli(["recent", "--limit", "5"]);
-          const lines = [
-            `viewer: http://${viewerHost}:${viewerPort}`,
-            `log: ${logPath || "disabled"}`,
-          ];
-          if (stats.exitCode === 0 && stats.stdout.trim()) {
-            lines.push("", "stats:", stats.stdout.trim());
+          const lines = [];
+          if (stats.exitCode === 0) {
+            lines.push(stats.stdout.trim() || "No stats yet.");
+          } else {
+            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
           }
-          if (recent.exitCode === 0 && recent.stdout.trim()) {
-            lines.push("", "recent:", recent.stdout.trim());
-          }
+          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
           return lines.join("\n");
         },
       }),
 
       "mem-recent": tool({
-        description: "Show recent codemem entries",
+        description:
+          "Show recent codemem entries for the current agent/project. Use mem-all-recent for all.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute({ limit }) {
+          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
+          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
+          if (recent.exitCode === 0) {
+            return recent.stdout.trim() || "No recent memories.";
+          }
+          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
+        },
+      }),
+
+      "mem-status": tool({
+        description:
+          "Show stats (global DB) + recent entries scoped to the current agent/project.",
+        args: {},
+        async execute() {
+          const scope = resolveAgentScope();
+          const [statsResult, recentResult] = await Promise.all([
+            runCli(["stats"]),
+            runCli(buildMemRecentCliArgs("5")),
+          ]);
+          const lines = [
+            `viewer: http://${viewerHost}:${viewerPort}`,
+            `log: ${logPath || "disabled"}`,
+            `scope: ${scope || "(no agent — whole DB)"}`,
+          ];
+          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
+            lines.push("", "stats (global DB):", statsResult.stdout.trim());
+          }
+          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
+            lines.push("", "recent (scoped):", recentResult.stdout.trim());
+          }
+          return lines.join("\n");
+        },
+      }),
+
+      "mem-specificagent-stats": tool({
+        description:
+          "Alias for mem-stats — stats + scope info for current agent/project.",
+        args: {},
+        async execute() {
+          const scope = resolveAgentScope();
+          const stats = await runCli(["stats"]);
+          const lines = [];
+          if (stats.exitCode === 0) {
+            lines.push(stats.stdout.trim() || "No stats yet.");
+          } else {
+            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
+          }
+          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
+          return lines.join("\n");
+        },
+      }),
+
+      "mem-specificagent-recent": tool({
+        description:
+          "Alias for mem-recent — recent entries scoped to the current agent/project.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute({ limit }) {
+          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
+          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
+          if (recent.exitCode === 0) {
+            return recent.stdout.trim() || "No recent memories.";
+          }
+          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
+        },
+      }),
+
+      // ── Global / cross-agent tools ─────────────────────────────────
+
+      "mem-all-stats": tool({
+        description: "Show codemem stats for the entire database (all agents).",
+        args: {},
+        async execute() {
+          const stats = await runCli(["stats"]);
+          if (stats.exitCode === 0) {
+            return stats.stdout.trim() || "No stats yet.";
+          }
+          return `Failed to fetch stats: ${stats.stderr || stats.exitCode}`;
+        },
+      }),
+
+      "mem-all-recent": tool({
+        description: "Show recent codemem entries for all agents/projects.",
         args: {
           limit: tool.schema.number().optional(),
         },
@@ -2082,15 +2571,26 @@ export const OpencodeMemPlugin = async ({
         },
       }),
 
-      "mem-stats": tool({
-        description: "Show codemem stats",
+      "mem-all-status": tool({
+        description: "Show stats + recent entries for the entire database (all agents).",
         args: {},
         async execute() {
-          const stats = await runCli(["stats"]);
-          if (stats.exitCode === 0) {
-            return stats.stdout.trim() || "No stats yet.";
+          const [statsResult, recentResult] = await Promise.all([
+            runCli(["stats"]),
+            runCli(["recent", "--limit", "5"]),
+          ]);
+          const lines = [
+            `viewer: http://${viewerHost}:${viewerPort}`,
+            `log: ${logPath || "disabled"}`,
+            "scope: ALL agents (global database)",
+          ];
+          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
+            lines.push("", "stats (global):", statsResult.stdout.trim());
           }
-          return `Failed to fetch stats: ${stats.stderr || stats.exitCode}`;
+          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
+            lines.push("", "recent (global):", recentResult.stdout.trim());
+          }
+          return lines.join("\n");
         },
       }),
     },

@@ -12,9 +12,9 @@ export async function loadMemories(project: string): Promise<PaginatedResponse> 
 
 export async function loadMemoriesPage(
 	project: string,
-	options?: { limit?: number; offset?: number; scope?: string },
+	options?: { limit?: number; offset?: number; scope?: string; agent?: string },
 ): Promise<PaginatedResponse> {
-	const query = buildProjectParams(project, options?.limit, options?.offset, options?.scope);
+	const query = buildProjectParams(project, options?.limit, options?.offset, options?.scope, options?.agent);
 	return fetchJson<PaginatedResponse>(`/api/observations?${query}`);
 }
 
@@ -67,9 +67,9 @@ export async function loadSummaries(project: string): Promise<PaginatedResponse>
 
 export async function loadSummariesPage(
 	project: string,
-	options?: { limit?: number; offset?: number; scope?: string },
+	options?: { limit?: number; offset?: number; scope?: string; agent?: string },
 ): Promise<PaginatedResponse> {
-	const query = buildProjectParams(project, options?.limit, options?.offset, options?.scope);
+	const query = buildProjectParams(project, options?.limit, options?.offset, options?.scope, options?.agent);
 	return fetchJson<PaginatedResponse>(`/api/summaries?${query}`);
 }
 

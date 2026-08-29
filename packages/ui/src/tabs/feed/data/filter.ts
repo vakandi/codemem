@@ -16,6 +16,15 @@ export function filterByType(items: FeedItem[]): FeedItem[] {
 	return items;
 }
 
+export function filterByAgent(items: FeedItem[]): FeedItem[] {
+	if (state.agentFilter === "all") return items;
+	return items.filter((i) => {
+		const actorId = String(i.actor_id || "").toLowerCase();
+		const agentFilter = state.agentFilter.toLowerCase();
+		return actorId.includes(agentFilter) || (i.actor_display_name || "").toLowerCase().includes(agentFilter);
+	});
+}
+
 export function filterByQuery(items: FeedItem[]): FeedItem[] {
 	const query = normalize(state.feedQuery);
 	if (!query) return items;
@@ -39,5 +48,5 @@ export function computeSignature(items: FeedItem[]): string {
 	const parts = items.map(
 		(i) => `${itemSignature(i)}:${i.kind || ""}:${i.created_at_utc || i.created_at || ""}`,
 	);
-	return `${state.feedTypeFilter}|${state.feedScopeFilter}|${state.currentProject}|${normalize(state.feedQuery)}|${parts.join("|")}`;
+	return `${state.feedTypeFilter}|${state.feedScopeFilter}|${state.agentFilter}|${state.currentProject}|${normalize(state.feedQuery)}|${parts.join("|")}`;
 }

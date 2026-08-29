@@ -12,16 +12,18 @@ import { renderStats } from "./render/stats";
 
 export async function loadHealthData() {
 	const previousActorId = state.lastStatsPayload?.identity?.actor_id || null;
-	const [statsPayload, usagePayload, _sessionsPayload, rawEventsPayload] = await Promise.all([
+	const [statsPayload, usagePayload, _sessionsPayload, rawEventsPayload, observerReport] = await Promise.all([
 		api.loadStats(),
 		api.loadUsage(state.currentProject),
 		api.loadSession(state.currentProject),
 		api.loadRawEvents(state.currentProject),
+		api.loadObserverReport().catch(() => null),
 	]);
 
 	state.lastStatsPayload = statsPayload || {};
 	state.lastUsagePayload = usagePayload || {};
 	state.lastRawEventsPayload = rawEventsPayload || {};
+	state.lastObserverReport = observerReport;
 	const nextActorId = state.lastStatsPayload?.identity?.actor_id || null;
 
 	renderStats();

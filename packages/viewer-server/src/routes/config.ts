@@ -25,7 +25,7 @@ type ConfigData = Record<string, unknown>;
 
 const REDACTED_VALUE = "[redacted]";
 
-const RUNTIMES = new Set(["api_http", "claude_sidecar"]);
+const RUNTIMES = new Set(["api_http", "claude_sidecar", "opencode_plugin"]);
 const AUTH_SOURCES = new Set(["auto", "env", "file", "command", "none"]);
 const HOT_RELOAD_KEYS = new Set(["raw_events_sweeper_interval_s"]);
 const PROTECTED_WRITE_KEYS = new Set<string>([
@@ -283,7 +283,7 @@ function validateAndApplyUpdate(
 		if (typeof value !== "string") return "observer_runtime must be string";
 		const runtime = value.trim().toLowerCase();
 		if (!RUNTIMES.has(runtime)) {
-			return "observer_runtime must be one of: api_http, claude_sidecar";
+			return "observer_runtime must be one of: api_http, claude_sidecar, opencode_plugin";
 		}
 		configData[key] = runtime;
 		return null;

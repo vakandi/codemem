@@ -1,6 +1,6 @@
 import { Fragment, h } from "preact";
 import { useState } from "preact/hooks";
-import { setFeedScopeFilter, setFeedTypeFilter, state } from "../../../lib/state";
+import { setFeedScopeFilter, setFeedTypeFilter, setAgentFilter, state } from "../../../lib/state";
 import { feedMetaText } from "../data/meta";
 import type { FeedItem, FeedViewOps } from "../types";
 import { ContextInspectorPanel } from "./ContextInspectorPanel";
@@ -47,6 +47,7 @@ export function FeedTabView({
 					onSelect: (value) => {
 						if (value === state.feedScopeFilter) return;
 						setFeedScopeFilter(value);
+						ops.updateFeedView(true);
 						void ops.loadFeedData();
 					},
 					options: [
@@ -67,6 +68,27 @@ export function FeedTabView({
 						{ value: "all", label: "All" },
 						{ value: "observations", label: "Observations" },
 						{ value: "summaries", label: "Summaries" },
+					],
+				}),
+				h(FeedToggle, {
+					active: state.agentFilter,
+					id: "agentFilterToggle",
+					onSelect: (value) => {
+						if (value === state.agentFilter) return;
+						setAgentFilter(value);
+						ops.updateFeedView(true);
+						void ops.loadFeedData();
+					},
+					options: [
+						{ value: "all", label: "All Agents" },
+						{ value: "elia", label: "Elia" },
+						{ value: "gilfoyle", label: "Gilfoyle" },
+						{ value: "setbon", label: "Setbon" },
+						{ value: "bene2luxe", label: "Bene2Luxe" },
+						{ value: "cobou-agency", label: "CoBou" },
+						{ value: "zovaboost", label: "ZovaBoost" },
+						{ value: "cobou-promoter", label: "CoBou Promo" },
+						{ value: "bene2luxe-promoter", label: "B2L Promo" },
 					],
 				}),
 				h(

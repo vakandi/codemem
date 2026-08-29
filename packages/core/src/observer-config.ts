@@ -541,9 +541,7 @@ export function resolveBuiltInProviderModel(
 		return [null, modelName || resolveBuiltInProviderDefaultModel(provider), {}];
 	}
 	const name = modelName || resolveBuiltInProviderDefaultModel(provider) || "";
-	const prefix = `${provider}/`;
-	const shortName = name.startsWith(prefix) ? name.slice(prefix.length) : name;
-	return ["https://opencode.ai/zen/v1", shortName || null, {}];
+	return ["https://opencode.ai/zen/v1", name || "big-pickle", {}];
 }
 
 /** Extract provider prefix from a model string like `"myprovider/model-name"`. */

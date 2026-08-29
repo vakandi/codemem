@@ -22,6 +22,7 @@ import {
 import { configRoutes } from "./routes/config.js";
 import { memoryRoutes } from "./routes/memory.js";
 import { observerStatusRoutes } from "./routes/observer-status.js";
+import { pluginObserverRoutes } from "./routes/plugin-observer.js";
 import { rawEventsRoutes } from "./routes/raw-events.js";
 import { statsRoutes } from "./routes/stats.js";
 import { syncProtocolRoutes, syncRoutes } from "./routes/sync.js";
@@ -98,6 +99,7 @@ export function createApp(opts?: AppOptions) {
 	);
 	app.route("/", configRoutes({ getSweeper: () => sweeper }));
 	app.route("/", rawEventsRoutes(storeFactory, sweeper));
+	app.route("/", pluginObserverRoutes(storeFactory, sweeper));
 	app.route("/", syncRoutes(storeFactory, getSyncRuntimeStatus));
 
 	// Static assets — serve under /assets/*

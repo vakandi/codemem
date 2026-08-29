@@ -82,6 +82,16 @@ export function renderHealthOverview() {
 	const syncRecentlyOk = syncAgeSeconds !== null && syncAgeSeconds <= 300;
 	const hasBacklog = rawPending >= 200;
 
+	// Observer dashboard (plugin observer)
+	const observerReport =
+		state.lastObserverReport && typeof state.lastObserverReport === "object"
+			? (state.lastObserverReport as Record<string, any>)
+			: null;
+	const observerCounts = observerReport?.batches?.counts || null;
+	const observerErrored = observerCounts ? Number(observerCounts.errored || 0) : 0;
+	const observerClaimed = observerCounts ? Number(observerCounts.claimed || 0) : 0;
+	const observerPending = observerCounts ? Number(observerCounts.pending || 0) : 0;
+
 	// Risk scoring
 	let riskScore = 0;
 	const drivers: string[] = [];
@@ -236,6 +246,17 @@ export function renderHealthOverview() {
 			title: "Raw-event queue pressure and flush reliability",
 		}),
 		buildHealthCard({
+			key: "observer-health",
+			label: "Observer",
+			value: observerReport ? `${observerErrored.toLocaleString()} errors` : "—",
+			detail: observerReport
+				? `${observerPending.toLocaleString()} pending · ${observerClaimed.toLocaleString()} claimed`
+				: "Observer report unavailable",
+			icon: observerErrored > 0 ? "alert-triangle" : "check-circle",
+			className: observerErrored > 0 ? "status-attention" : undefined,
+			title: "Plugin observer batches and per-agent memory attribution",
+		}),
+		buildHealthCard({
 			key: "retrieval-impact",
 			label: "Retrieval impact",
 			value: reductionLabel,
@@ -261,6 +282,79 @@ export function renderHealthOverview() {
 		}),
 	];
 	renderHealthCards(healthGrid, cards);
+
+	// Render observer section + retry button in the actions area.
+	if (healthActions) {
+		const recent: any[] = Array.isArray(observerReport?.batches?.recent)
+			? observerReport!.batches.recent
+			: [];
+		const byActor: any[] = Array.isArray(observerReport?.memories?.by_actor)
+			? observerReport!.memories.by_actor
+			: [];
+
+		const rows = recent
+			.slice(0, 8)
+			.map((b) => {
+				const id = String(b?.id ?? "");
+				const status = String(b?.status ?? "");
+				const stream = String(b?.stream_id ?? "");
+				const updated = String(b?.updated_at ?? "");
+				const attempts = String(b?.attempt_count ?? "");
+				const err = String(b?.error_message ?? "");
+				const errShort = err ? ` — ${err.slice(0, 80)}` : "";
+				return `<div class="section-meta" style="margin: 6px 0 0 0; font-size: 12px;">
+          <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">#${id}</span>
+          <span> ${status}</span>
+          <span style="opacity:0.75;"> ${attempts ? `· attempts ${attempts}` : ""} · ${updated}</span>
+          <span style="opacity:0.75;"> ${stream ? `· ${stream}` : ""}${errShort}</span>
+        </div>`;
+			})
+			.join("");
+
+		const actorRows = byActor
+			.slice(0, 8)
+			.map((a) => {
+				const actorId = String(a?.actor_id ?? "unknown");
+				const count = Number(a?.count || 0);
+				const last = String(a?.last_created_at ?? "");
+				return `<div class="section-meta" style="margin: 4px 0 0 0; font-size: 12px;">
+          <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">${actorId}</span>
+          <span style="opacity:0.8;"> · ${count.toLocaleString()} items</span>
+          <span style="opacity:0.7;"> · last ${last}</span>
+        </div>`;
+			})
+			.join("");
+
+		const retryDisabled = observerErrored <= 0;
+		const retryLabel = retryDisabled ? "No observer errors" : `Retry ${observerErrored} observer errors`;
+
+		healthActions.innerHTML = `
+      <div class="card" style="margin-top: 12px;">
+        <div class="section-header" style="margin-bottom: 6px;">
+          <h3 style="margin: 0;">Observer</h3>
+          <div class="section-actions">
+            <button class="settings-button" id="observerRetryButton" ${retryDisabled ? "disabled" : ""}>${retryLabel}</button>
+          </div>
+        </div>
+        <div class="section-meta">Recent batches</div>
+        ${rows || `<div class="section-meta">No recent batches.</div>`}
+        <div class="section-meta" style="margin-top: 10px;">Memories by actor</div>
+        ${actorRows || `<div class="section-meta">No actor attribution yet.</div>`}
+      </div>
+    `;
+
+		const btn = document.getElementById("observerRetryButton");
+		if (btn && !retryDisabled) {
+			btn.onclick = async () => {
+				try {
+					await api.retryObserverErrors();
+					await api.loadObserverStatus().catch(() => {});
+				} catch {
+					// ignore
+				}
+			};
+		}
+	}
 
 	// Recommendations
 	const triggerSync = async () => {

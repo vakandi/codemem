@@ -1045,6 +1045,8 @@ export class ObserverClient {
 	private readonly _claudeCommand: string[];
 	private readonly _sidecarModel: string;
 
+	private _sdkClient: any | null = null;
+
 	// OAuth consumer state
 	private _codexAccess: string | null = null;
 	private _codexAccountId: string | null = null;
@@ -1058,11 +1060,12 @@ export class ObserverClient {
 	private _sidecarModelFallbackApplied = false;
 	private _sidecarModelFallbackReason: string | null = null;
 
-	constructor(config?: ObserverConfig) {
+	constructor(config?: ObserverConfig, sdkClient?: any) {
 		const configWasProvided = config !== undefined;
 		const cfg = config ?? loadObserverConfig();
 		const explicitConfigKeys = resolveExplicitObserverConfigKeys(cfg, configWasProvided);
 		this._observerExplicitConfigKeys = [...explicitConfigKeys];
+		this._sdkClient = sdkClient ?? null;
 
 		const provider = (cfg.observerProvider ?? "").toLowerCase();
 		const model = (cfg.observerModel ?? "").trim();
@@ -1099,7 +1102,16 @@ export class ObserverClient {
 		// Resolve runtime
 		const runtimeRaw = cfg.observerRuntime;
 		const runtime = typeof runtimeRaw === "string" ? runtimeRaw.trim().toLowerCase() : "api_http";
-		this.runtime = runtime === "claude_sidecar" ? "claude_sidecar" : "api_http";
+		if (runtime === "claude_sidecar") {
+			this.runtime = "claude_sidecar";
+		} else if (runtime === "opencode_plugin" || (resolved === "opencode" && sdkClient)) {
+			this.runtime = "opencode_plugin";
+		} else if (resolved === "opencode") {
+			// opencode provider without SDK client → use HTTP API
+			this.runtime = "opencode_plugin";
+		} else {
+			this.runtime = "api_http";
+		}
 
 		// Resolve model
 		if (model) {
@@ -1563,6 +1575,10 @@ export class ObserverClient {
 	// -----------------------------------------------------------------------
 
 	private async _callOnce(systemPrompt: string, userPrompt: string): Promise<string | null> {
+		if (this.runtime === "opencode_plugin") {
+			return this._callOpenCodeZenAPI(systemPrompt, userPrompt);
+		}
+
 		// Claude sidecar path — dispatches before any API-based paths
 		if (this.runtime === "claude_sidecar") {
 			return this._callSidecar(systemPrompt, userPrompt);
@@ -1614,14 +1630,112 @@ export class ObserverClient {
 		const payload = buildAnthropicPayload(this.model, systemPrompt, userPrompt, this.maxTokens);
 
 		return this._fetchJSON(url, mergedHeaders, payload, {
-			parseResponse: parseAnthropicResponse,
-			providerLabel: "Anthropic",
+			parseResponse: this.openaiUseResponses ? parseOpenAIResponsesResponse : parseOpenAIResponse,
+			providerLabel: capitalize(this.provider),
 		});
 	}
 
-	// -----------------------------------------------------------------------
-	// OpenAI direct (API key)
-	// -----------------------------------------------------------------------
+	private async _callOpenCodeZenAPI(
+		systemPrompt: string,
+		userPrompt: string,
+	): Promise<string | null> {
+		const prompt = `${systemPrompt}\n\n${userPrompt}`;
+		const baseUrl = "http://127.0.0.1:4096";
+		const modelID = this.model || "big-pickle";
+		const TIMEOUT_MS = 120_000;
+		const POLL_INTERVAL_MS = 1000;
+
+		console.log(`[OBSERVER] _callOpenCodeZenAPI model=${modelID} prompt_len=${prompt.length}`);
+
+		try {
+			// 1. Create a dedicated session for memory extraction
+			const createResp = await fetch(`${baseUrl}/session`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ title: "codemem-observer" }),
+				signal: AbortSignal.timeout(10_000),
+			});
+			if (!createResp.ok) {
+				const errText = await createResp.text().catch(() => "");
+				console.log(`[OBSERVER] session create failed ${createResp.status}: ${errText.slice(0, 200)}`);
+				this._setLastError(`OpenCode session create error: ${createResp.status}`, "api_error");
+				return null;
+			}
+			const session = await createResp.json() as Record<string, unknown>;
+			const sessionId = String(session?.id ?? "");
+			if (!sessionId) {
+				console.log(`[OBSERVER] session create returned no id`);
+				this._setLastError("OpenCode session create returned no id", "api_error");
+				return null;
+			}
+			console.log(`[OBSERVER] created session ${sessionId}`);
+
+			// 2. Send via prompt_async (returns immediately; blocking /message can hit client timeouts)
+			const promptResp = await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: { providerID: "opencode", modelID },
+					parts: [{ type: "text", text: prompt }],
+				}),
+				signal: AbortSignal.timeout(30_000),
+			});
+			if (!promptResp.ok) {
+				const errText = await promptResp.text().catch(() => "");
+				console.log(`[OBSERVER] prompt_async failed ${promptResp.status}: ${errText.slice(0, 200)}`);
+				this._setLastError(`OpenCode prompt_async error: ${promptResp.status}`, "api_error");
+				return null;
+			}
+			console.log(`[OBSERVER] prompt_async accepted, polling for response...`);
+
+			// 3. Poll for the assistant response
+			const deadline = Date.now() + TIMEOUT_MS;
+			while (Date.now() < deadline) {
+				await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+
+				const msgsResp = await fetch(`${baseUrl}/session/${sessionId}/message`, {
+					signal: AbortSignal.timeout(10_000),
+				});
+				if (!msgsResp.ok) continue;
+
+				const msgs = await msgsResp.json() as Array<{ info: Record<string, unknown>; parts: Array<Record<string, unknown>> }>;
+				if (!Array.isArray(msgs)) continue;
+
+				// Find the last assistant message that is complete (not streaming)
+				for (let i = msgs.length - 1; i >= 0; i--) {
+					const msg = msgs[i];
+					const role = String(msg?.info?.role ?? "");
+					const finished = msg?.info?.finished;
+					if (role !== "assistant" || !finished) continue;
+
+					const textParts = (msg.parts ?? [])
+						.filter((p) => p.type === "text" && p.text)
+						.map((p) => String(p.text));
+					const output = textParts.join("\n").trim();
+					if (output) {
+						console.log(`[OBSERVER] got response len=${output.length}, cleaning up session`);
+						// Clean up session asynchronously
+						fetch(`${baseUrl}/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
+						return output;
+					}
+				}
+			}
+
+			console.log(`[OBSERVER] timeout after ${TIMEOUT_MS}ms`);
+			this._setLastError("OpenCode observer timeout", "timeout");
+			fetch(`${baseUrl}/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
+			return null;
+		} catch (err) {
+			const errMsg = err instanceof Error ? err.message : String(err);
+			console.log(`[OBSERVER] exception: ${errMsg}`);
+			if (errMsg.toLowerCase().includes("abort") || errMsg.toLowerCase().includes("timeout")) {
+				this._setLastError("OpenCode observer timeout", "timeout");
+			} else {
+				this._setLastError(`OpenCode observer error: ${errMsg}`, "api_error");
+			}
+			return null;
+		}
+	}
 
 	private async _callOpenAIDirect(
 		systemPrompt: string,

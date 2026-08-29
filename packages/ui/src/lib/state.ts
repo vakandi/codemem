@@ -193,6 +193,9 @@ export type FeedFilter = (typeof FEED_FILTERS)[number];
 export const FEED_SCOPES = ["all", "mine", "theirs"] as const;
 export type FeedScope = (typeof FEED_SCOPES)[number];
 
+export const AGENT_FILTERS = ["all", "elia", "gilfoyle", "setbon", "bene2luxe", "cobou-agency", "zovaboost", "cobou-promoter", "bene2luxe-promoter"] as const;
+export type AgentFilter = (typeof AGENT_FILTERS)[number];
+
 /* ── Mutable application state ─────────────────────────────── */
 
 export const state = {
@@ -211,6 +214,9 @@ export const state = {
 	/* Feed */
 	feedTypeFilter: "all" as FeedFilter,
 	feedScopeFilter: "all" as FeedScope,
+	agentFilter: "all" as AgentFilter,
+	/** Set when the last feed API load failed; cleared on successful load start. */
+	feedLoadError: null as string | null,
 	feedQuery: "",
 	lastFeedItems: [] as unknown[],
 	lastFeedFilteredCount: 0,
@@ -254,6 +260,8 @@ export const state = {
 	lastSyncAttempts: [] as unknown[],
 	lastSyncLegacyDevices: [] as unknown[],
 	lastSyncViewModel: null as UiSyncViewModel | null,
+	/* Observer */
+	lastObserverReport: null as unknown | null,
 	lastSyncDuplicatePersonDecisions: {} as Record<string, string>,
 	pairingPayloadRaw: null as CachedPairingPayload | null,
 	pairingCommandRaw: "",
@@ -345,6 +353,17 @@ export function setFeedScopeFilter(value: string) {
 	localStorage.setItem(FEED_SCOPE_KEY, state.feedScopeFilter);
 }
 
+const AGENT_FILTER_KEY = "codemem-agent-filter";
+export function getAgentFilter(): AgentFilter {
+	const saved = localStorage.getItem(AGENT_FILTER_KEY);
+	return AGENT_FILTERS.includes(saved as AgentFilter) ? (saved as AgentFilter) : "all";
+}
+
+export function setAgentFilter(value: string) {
+	state.agentFilter = AGENT_FILTERS.includes(value as AgentFilter) ? (value as AgentFilter) : "all";
+	localStorage.setItem(AGENT_FILTER_KEY, state.agentFilter);
+}
+
 export function isSyncDiagnosticsOpen(): boolean {
 	return localStorage.getItem(SYNC_DIAGNOSTICS_KEY) === "1";
 }
@@ -387,6 +406,8 @@ export function initState() {
 	state.activeTab = getActiveTab();
 	state.feedTypeFilter = getFeedTypeFilter();
 	state.feedScopeFilter = getFeedScopeFilter();
+	state.agentFilter = getAgentFilter();
+	state.feedLoadError = null;
 	state.syncDiagnosticsOpen = isSyncDiagnosticsOpen();
 	try {
 		state.syncPairingOpen = localStorage.getItem(SYNC_PAIRING_KEY) === "1";

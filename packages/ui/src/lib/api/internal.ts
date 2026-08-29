@@ -32,9 +32,14 @@ export function buildProjectParams(
 	limit?: number,
 	offset?: number,
 	scope?: string,
+	agent?: string,
 ): string {
 	const params = new URLSearchParams();
-	params.set("project", project || "");
+	// If agent filter is active, scope project to project/agent
+	const effectiveProject = agent && agent !== "all"
+		? (project ? `${project}/${agent}` : agent)
+		: (project || "");
+	params.set("project", effectiveProject);
 	if (typeof limit === "number") params.set("limit", String(limit));
 	if (typeof offset === "number") params.set("offset", String(offset));
 	if (scope) params.set("scope", scope);

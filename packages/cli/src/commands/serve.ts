@@ -517,6 +517,12 @@ async function startForegroundViewer(invocation: ResolvedServeInvocation): Promi
 	const preparedDb = prepareViewerDatabase(invocation.dbPath);
 
 	const observer = new ObserverClient();
+
+	// When runtime is opencode_plugin, the plugin handles LLM extraction directly.
+	// Disable the sweeper's flush phases by setting the env var before instantiation.
+	if (observer.runtime === "opencode_plugin") {
+		process.env.CODEMEM_RAW_EVENTS_SWEEPER = "0";
+	}
 	let store: MemoryStore;
 	try {
 		store = getStore();

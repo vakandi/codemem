@@ -6,6 +6,7 @@
  * call sites. */
 
 export { loadConfig, loadObserverStatus, saveConfig } from "./api/config";
+export { loadObserverReport, retryObserverErrors } from "./api/observer";
 export {
 	archiveCoordinatorAdminGroup,
 	createCoordinatorAdminGroup,

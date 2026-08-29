@@ -35,12 +35,15 @@ let loadMoreInFlight = false;
 let feedScrollHandlerBound = false;
 let feedProjectGeneration = 0;
 let lastFeedScope = "all";
+/** Tracks the agent filter aligned with pagination; seeded in `initFeedTab`. */
+let lastFeedAgent: string | null = null;
 
 import { ensureFeedRenderBoundary, renderIntoFeedMount } from "./feed/data/mount";
 
 function resetPagination(project: string) {
 	lastFeedProject = project;
 	lastFeedScope = state.feedScopeFilter;
+	lastFeedAgent = state.agentFilter;
 	feedProjectGeneration += 1;
 	observationOffset = 0;
 	summaryOffset = 0;
@@ -100,11 +103,13 @@ import type { FeedViewOps } from "./feed/types";
 
 /* ── Filtering ───────────────────────────────────────────── */
 
-import { computeSignature, filterByQuery, filterByType } from "./feed/data/filter";
+import {
+	computeSignature, filterByQuery, filterByType, filterByAgent } from "./feed/data/filter";
 
 async function loadMoreFeedPage() {
 	if (loadMoreInFlight || !hasMorePages()) return;
 	const requestProject = state.currentProject || "";
+	const requestAgent = state.agentFilter !== "all" ? state.agentFilter : undefined;
 	const requestGeneration = feedProjectGeneration;
 	const startObservationOffset = observationOffset;
 	const startSummaryOffset = summaryOffset;
@@ -116,6 +121,7 @@ async function loadMoreFeedPage() {
 						limit: OBSERVATION_PAGE_SIZE,
 						offset: startObservationOffset,
 						scope: state.feedScopeFilter,
+						agent: requestAgent,
 					})
 				: Promise.resolve({
 						items: [],
@@ -126,6 +132,7 @@ async function loadMoreFeedPage() {
 						limit: SUMMARY_PAGE_SIZE,
 						offset: startSummaryOffset,
 						scope: state.feedScopeFilter,
+						agent: requestAgent,
 					})
 				: Promise.resolve({
 						items: [],
@@ -135,7 +142,8 @@ async function loadMoreFeedPage() {
 
 		if (
 			requestGeneration !== feedProjectGeneration ||
-			requestProject !== (state.currentProject || "")
+			requestProject !== (state.currentProject || "") ||
+			requestAgent !== (state.agentFilter !== "all" ? state.agentFilter : undefined)
 		) {
 			return;
 		}
@@ -160,6 +168,10 @@ async function loadMoreFeedPage() {
 
 		state.lastFeedItems = feedItems;
 		updateFeedView();
+	} catch (err) {
+		state.feedLoadError =
+			err instanceof Error ? err.message : `Load more failed: ${String(err)}`;
+		updateFeedView(true);
 	} finally {
 		loadMoreInFlight = false;
 	}
@@ -201,6 +213,8 @@ function renderProjectSwitchLoadingState() {
 /* ── Public API ──────────────────────────────────────────── */
 
 export function initFeedTab() {
+	lastFeedScope = state.feedScopeFilter;
+	lastFeedAgent = state.agentFilter;
 	ensureFeedRenderBoundary();
 	renderFeedTab(
 		state.lastFeedItems,
@@ -235,7 +249,8 @@ export function updateFeedView(force = false) {
 
 	const scrollY = window.scrollY;
 	const byType = filterByType(state.lastFeedItems as FeedItem[]);
-	const visible = filterByQuery(byType);
+	const byAgent = filterByAgent(byType);
+	const visible = filterByQuery(byAgent);
 
 	const sig = computeSignature(visible);
 	const changed = force || sig !== state.lastFeedSignature;
@@ -251,64 +266,86 @@ export function updateFeedView(force = false) {
 
 export async function loadFeedData() {
 	const project = state.currentProject || "";
+	const agent = state.agentFilter !== "all" ? state.agentFilter : undefined;
 	const scopeChanged = state.feedScopeFilter !== lastFeedScope;
-	if (project !== lastFeedProject || scopeChanged) {
+	const agentChanged = lastFeedAgent === null || state.agentFilter !== lastFeedAgent;
+	state.feedLoadError = null;
+
+	if (project !== lastFeedProject || scopeChanged || agentChanged) {
 		resetPagination(project);
 		renderProjectSwitchLoadingState();
+		updateFeedView(true);
 	}
 	const requestGeneration = feedProjectGeneration;
 
 	const observationsLimit = OBSERVATION_PAGE_SIZE;
 	const summariesLimit = SUMMARY_PAGE_SIZE;
 
-	const [observations, summaries] = await Promise.all([
-		api.loadMemoriesPage(project, {
-			limit: observationsLimit,
-			offset: 0,
-			scope: state.feedScopeFilter,
-		}),
-		api.loadSummariesPage(project, {
-			limit: summariesLimit,
-			offset: 0,
-			scope: state.feedScopeFilter,
-		}),
-	]);
+	try {
+		const [observations, summaries] = await Promise.all([
+			api.loadMemoriesPage(project, {
+				limit: observationsLimit,
+				offset: 0,
+				scope: state.feedScopeFilter,
+				agent,
+			}),
+			api.loadSummariesPage(project, {
+				limit: summariesLimit,
+				offset: 0,
+				scope: state.feedScopeFilter,
+				agent,
+			}),
+		]);
 
-	if (requestGeneration !== feedProjectGeneration || project !== (state.currentProject || "")) {
-		return;
-	}
+		if (
+			requestGeneration !== feedProjectGeneration ||
+			project !== (state.currentProject || "") ||
+			agent !== (state.agentFilter !== "all" ? state.agentFilter : undefined)
+		) {
+			return;
+		}
 
-	const summaryItems = (summaries.items || []) as FeedItem[];
-	const observationItems = (observations.items || []) as FeedItem[];
-	const filtered = observationItems.filter((i) => !isLowSignalObservation(i));
-	const filteredCount = observationItems.length - filtered.length;
-	const firstPageFeedItems = [...summaryItems, ...filtered].sort((a, b) => {
-		return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
-	});
-	const feedItems = mergeRefreshFeedItems(state.lastFeedItems as FeedItem[], firstPageFeedItems);
-
-	// Only flag newPulse on genuine incremental arrivals. First-time load has
-	// an empty lastFeedItems and every row "looks new" — skip that case so we
-	// don't bulk-pulse the whole feed on open/tab-switch/project-switch.
-	const previousItems = state.lastFeedItems as FeedItem[];
-	const newCount = countNewItems(feedItems, previousItems);
-	if (newCount && previousItems.length > 0) {
-		const seen = new Set(previousItems.map(itemKey));
-		feedItems.forEach((item) => {
-			if (!seen.has(itemKey(item))) state.newItemKeys.add(itemKey(item));
+		const summaryItems = (summaries.items || []) as FeedItem[];
+		const observationItems = (observations.items || []) as FeedItem[];
+		const filtered = observationItems.filter((i) => !isLowSignalObservation(i));
+		const filteredCount = observationItems.length - filtered.length;
+		const firstPageFeedItems = [...summaryItems, ...filtered].sort((a, b) => {
+			return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
 		});
-	}
+		const feedItems = mergeRefreshFeedItems(state.lastFeedItems as FeedItem[], firstPageFeedItems);
 
-	state.pendingFeedItems = null;
-	state.lastFeedItems = feedItems;
-	state.lastFeedFilteredCount = Math.max(state.lastFeedFilteredCount, filteredCount);
-	summaryHasMore = pageHasMore(summaries, summaryItems.length, summariesLimit);
-	observationHasMore = pageHasMore(observations, observationItems.length, observationsLimit);
-	summaryOffset = Math.max(summaryOffset, pageNextOffset(summaries, summaryItems.length));
-	observationOffset = Math.max(
-		observationOffset,
-		pageNextOffset(observations, observationItems.length),
-	);
-	lastFeedScope = state.feedScopeFilter;
-	updateFeedView();
+		// Only flag newPulse on genuine incremental arrivals. First-time load has
+		// an empty lastFeedItems and every row "looks new" — skip that case so we
+		// don't bulk-pulse the whole feed on open/tab-switch/project-switch.
+		const previousItems = state.lastFeedItems as FeedItem[];
+		const newCount = countNewItems(feedItems, previousItems);
+		if (newCount && previousItems.length > 0) {
+			const seen = new Set(previousItems.map(itemKey));
+			feedItems.forEach((item) => {
+				if (!seen.has(itemKey(item))) state.newItemKeys.add(itemKey(item));
+			});
+		}
+
+		state.pendingFeedItems = null;
+		state.lastFeedItems = feedItems;
+		state.lastFeedFilteredCount = Math.max(state.lastFeedFilteredCount, filteredCount);
+		summaryHasMore = pageHasMore(summaries, summaryItems.length, summariesLimit);
+		observationHasMore = pageHasMore(observations, observationItems.length, observationsLimit);
+		summaryOffset = Math.max(summaryOffset, pageNextOffset(summaries, summaryItems.length));
+		observationOffset = Math.max(
+			observationOffset,
+			pageNextOffset(observations, observationItems.length),
+		);
+		lastFeedScope = state.feedScopeFilter;
+		lastFeedAgent = state.agentFilter;
+		updateFeedView();
+	} catch (err) {
+		state.feedLoadError =
+			err instanceof Error ? err.message : `Failed to load feed: ${String(err)}`;
+		state.lastFeedItems = [];
+		state.pendingFeedItems = null;
+		state.lastFeedSignature = "";
+		lastFeedAgent = null;
+		updateFeedView(true);
+	}
 }

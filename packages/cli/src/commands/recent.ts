@@ -15,7 +15,8 @@ const cmd = new Command("recent")
 	.option("--limit <n>", "max results", "5")
 	.option("--project <project>", "project identifier (defaults to git repo root)")
 	.option("--all-projects", "search across all projects")
-	.option("--kind <kind>", "filter by memory kind");
+	.option("--kind <kind>", "filter by memory kind")
+	.option("--actor-id <actorId>", "filter by actor ID (agent name)");
 
 addDbOption(cmd);
 addJsonOption(cmd);
@@ -33,8 +34,9 @@ cmd.action(
 		const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 		try {
 			const limit = Math.max(1, Number.parseInt(opts.limit, 10) || 5);
-			const filters: { kind?: string; project?: string } = {};
-			if (opts.kind) filters.kind = opts.kind;
+	const filters: { kind?: string; project?: string; include_actor_ids?: string[] } = {};
+		if (opts.kind) filters.kind = opts.kind;
+		if (opts.actorId) filters.include_actor_ids = [opts.actorId];
 			if (!opts.allProjects) {
 				const defaultProject = process.env.CODEMEM_PROJECT?.trim() || null;
 				const project = defaultProject || resolveProject(process.cwd(), opts.project ?? null);

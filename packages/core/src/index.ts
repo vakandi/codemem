@@ -196,7 +196,7 @@ export {
 export { isLowSignalObservation, normalizeObservation } from "./ingest-filters.js";
 export type { IngestOptions } from "./ingest-pipeline.js";
 export { cleanOrphanSessions, ingest, main as ingestMain } from "./ingest-pipeline.js";
-export { buildObserverPrompt } from "./ingest-prompts.js";
+export { buildObserverPrompt, truncateObserverTranscript } from "./ingest-prompts.js";
 export {
 	isSensitiveFieldName,
 	sanitizePayload,

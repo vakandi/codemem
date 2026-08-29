@@ -384,6 +384,11 @@ export class RawEventSweeper {
 			this.store.purgeRawEvents(retentionMs);
 		}
 
+		// When runtime is opencode_plugin, the plugin handles LLM calls directly.
+		// The sweeper must not compete for batches — skip stuck marking and all flush phases.
+		const observerRuntime = (this.ingestOpts?.observer as any)?.runtime ?? null;
+		if (observerRuntime === "opencode_plugin") return;
+
 		// Mark stuck batches as error
 		const stuckMs = this.stuckBatchMs();
 		if (stuckMs > 0) {

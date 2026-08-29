@@ -14,11 +14,26 @@ export function projectColumnClause(
 ): { clause: string; params: string[] } {
 	const trimmed = project.trim();
 	if (!trimmed) return { clause: "", params: [] };
-	const value = /[\\/]/.test(trimmed) ? projectBasename(trimmed) : trimmed;
-	if (!value) return { clause: "", params: [] };
+	const isAbsolutePath = trimmed.startsWith("/") || trimmed.startsWith("\\");
+	const slashCount = (trimmed.match(/[\/\\]/g) || []).length;
+	const isScopedProject = !isAbsolutePath && slashCount === 1;
+	const basenameValue = projectBasename(trimmed);
+	if (!basenameValue) return { clause: "", params: [] };
+	if (isAbsolutePath || slashCount > 1) {
+		return {
+			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
+			params: [basenameValue, `%/${basenameValue}`, `%\\${basenameValue}`],
+		};
+	}
+	if (isScopedProject) {
+		return {
+			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ? OR ${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
+			params: [trimmed, `%/${trimmed}`, `%\\${trimmed}`, basenameValue, `%/${basenameValue}`, `%\\${basenameValue}`],
+		};
+	}
 	return {
-		clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
-		params: [value, `%/${value}`, `%\\${value}`],
+		clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
+		params: [trimmed, `%/${trimmed}`, `%\\${trimmed}`, `${trimmed}/%`, `${trimmed}\\%`],
 	};
 }
 
@@ -34,11 +49,15 @@ export function projectMatchesFilter(
 	if (!itemProject) return false;
 	const normalizedFilter = projectFilter.trim().replaceAll("\\", "/");
 	if (!normalizedFilter) return true;
-	const filterValue = normalizedFilter.includes("/")
-		? projectBasename(normalizedFilter)
-		: normalizedFilter;
 	const normalizedProject = itemProject.replaceAll("\\", "/");
-	return normalizedProject === filterValue || normalizedProject.endsWith(`/${filterValue}`);
+	if (normalizedProject === normalizedFilter) return true;
+	if (normalizedProject.endsWith(`/${normalizedFilter}`)) return true;
+	if (normalizedFilter.includes("/")) {
+		const filterBase = projectBasename(normalizedFilter);
+		if (normalizedProject === filterBase || normalizedProject.endsWith(`/${filterBase}`)) return true;
+		return false;
+	}
+	return normalizedProject.startsWith(`${normalizedFilter}/`);
 }
 
 function findGitAnchor(startCwd: string): string | null {
