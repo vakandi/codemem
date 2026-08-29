@@ -19,12 +19,29 @@ export function projectColumnClause(
 ): { clause: string; params: string[] } {
 	const trimmed = project.trim();
 	if (!trimmed) return { clause: "", params: [] };
-	const value = /[\\/]/.test(trimmed) ? projectBasename(trimmed) : trimmed;
-	if (!value) return { clause: "", params: [] };
-	const escaped = escapeSqlLikePattern(value);
+	const isAbsolutePath = trimmed.startsWith("/") || trimmed.startsWith("\\");
+	const slashCount = (trimmed.match(/[/\\]/g) || []).length;
+	const isScopedProject = !isAbsolutePath && slashCount === 1;
+	const basenameValue = projectBasename(trimmed);
+	if (!basenameValue) return { clause: "", params: [] };
+	if (isAbsolutePath || slashCount > 1) {
+		const escaped = escapeSqlLikePattern(basenameValue);
+		return {
+			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\')`,
+			params: [basenameValue, `%/${escaped}`, `%\\${escaped}`],
+		};
+	}
+	if (isScopedProject) {
+		const escaped = escapeSqlLikePattern(trimmed);
+		return {
+			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\')`,
+			params: [trimmed, `%/${escaped}`, `%\\${escaped}`],
+		};
+	}
+	const escaped = escapeSqlLikePattern(trimmed);
 	return {
-		clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\')`,
-		params: [value, `%/${escaped}`, `%\\${escaped}`],
+		clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\' OR ${columnExpr} LIKE ? ESCAPE '\\')`,
+		params: [trimmed, `%/${escaped}`, `%\\${escaped}`, `${escaped}/%`, `${escaped}\\%`],
 	};
 }
 
@@ -40,11 +57,20 @@ export function projectMatchesFilter(
 	if (!itemProject) return false;
 	const normalizedFilter = projectFilter.trim().replaceAll("\\", "/");
 	if (!normalizedFilter) return true;
-	const filterValue = normalizedFilter.includes("/")
-		? projectBasename(normalizedFilter)
-		: normalizedFilter;
 	const normalizedProject = itemProject.replaceAll("\\", "/");
-	return normalizedProject === filterValue || normalizedProject.endsWith(`/${filterValue}`);
+	if (normalizedProject === normalizedFilter) return true;
+	if (normalizedProject.endsWith(`/${normalizedFilter}`)) return true;
+	if (normalizedFilter.includes("/")) {
+		const isAbsolute = normalizedFilter.startsWith("/");
+		const slashCount = (normalizedFilter.match(/\//g) || []).length;
+		if (isAbsolute || slashCount > 1) {
+			const filterBase = projectBasename(normalizedFilter);
+			if (normalizedProject === filterBase || normalizedProject.endsWith(`/${filterBase}`))
+				return true;
+		}
+		return false;
+	}
+	return normalizedProject.startsWith(`${normalizedFilter}/`);
 }
 
 function findGitAnchor(startCwd: string): string | null {
