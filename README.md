@@ -11,6 +11,11 @@ Persistent memory for [OpenCode](https://opencode.ai) and [Claude Code](https://
 - **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
 - **Peer-to-peer sync** — replicate memories across machines without a central service
 
+> **EliaAI fork (vakandi/codemem)** — based on `kunickiaj/codemem` with production fixes for the EliaAI subworker fleet (verified Aug 2026):
+> - **Strict scoped project isolation** — `EliaAI` matches `EliaAI/*` children, `EliaAI/gilfoyle` is exact-only (no `gilfoyle` basename leak from `nayo-app-fastapi/gilfoyle`). Fixes cross-repo injection where `EliaAI` was pulling `nayo` memories.
+> - **SQL LIKE safety** — `ESCAPE '\'` for `%`/`_` in project names.
+> - **EliaAI subworker integration** — `subworkers/server` runs fully dockerized (`elia-subworker-srv` 5656+5655, `TZ=Africa/Casablanca`, `opencode-data` volume for persistence, manual `POST /sessions/{name}/{id}/continue` for TopBar).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/codemem-dark.png">
   <img alt="codemem viewer — feed tab" src="docs/images/codemem-light.png">
