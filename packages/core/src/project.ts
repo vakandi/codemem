@@ -27,8 +27,8 @@ export function projectColumnClause(
 	}
 	if (isScopedProject) {
 		return {
-			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ? OR ${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
-			params: [trimmed, `%/${trimmed}`, `%\\${trimmed}`, basenameValue, `%/${basenameValue}`, `%\\${basenameValue}`],
+			clause: `(${columnExpr} = ? OR ${columnExpr} LIKE ? OR ${columnExpr} LIKE ?)`,
+			params: [trimmed, `%/${trimmed}`, `%\\${trimmed}`],
 		};
 	}
 	return {
@@ -53,8 +53,12 @@ export function projectMatchesFilter(
 	if (normalizedProject === normalizedFilter) return true;
 	if (normalizedProject.endsWith(`/${normalizedFilter}`)) return true;
 	if (normalizedFilter.includes("/")) {
-		const filterBase = projectBasename(normalizedFilter);
-		if (normalizedProject === filterBase || normalizedProject.endsWith(`/${filterBase}`)) return true;
+		const isAbsolute = normalizedFilter.startsWith("/");
+		const slashCount = (normalizedFilter.match(/\//g) || []).length;
+		if (isAbsolute || slashCount > 1) {
+			const filterBase = projectBasename(normalizedFilter);
+			if (normalizedProject === filterBase || normalizedProject.endsWith(`/${filterBase}`)) return true;
+		}
 		return false;
 	}
 	return normalizedProject.startsWith(`${normalizedFilter}/`);
